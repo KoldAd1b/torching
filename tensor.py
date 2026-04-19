@@ -1269,3 +1269,941 @@ class Tensor:
         return output
 
 
+    # Comparision operations 
+    def _compare(self, other, op):
+        if isinstance(other, Tensor):
+            other_data = other.data
+        else:
+            other_data = other
+        return Tensor(op(self.data, other_data), requires_grad=False)
+
+    def __eq__(self, other):
+        return self._compare(other, lambda a, b: a == b)
+
+    def __ne__(self, other):
+        return self._compare(other, lambda a, b: a != b)
+
+    def __lt__(self, other):
+        return self._compare(other, lambda a, b: a < b)
+
+    def __le__(self, other):
+        return self._compare(other, lambda a, b: a <= b)
+
+    def __gt__(self, other):
+        return self._compare(other, lambda a, b: a > b)
+
+    def __ge__(self, other):
+        return self._compare(other, lambda a, b: a >= b)
+    
+    def any(self):
+        return self.xp.any(self.data._array)
+    
+    # Indexing operations 
+
+    def __getitem__(self, idx):
+        """
+        Supports slices, ints, arrays, and tuple-of-arrays indexing.
+        """
+        
+        # Convert Tensor indices to cp arrays
+        if isinstance(idx, Tensor):
+            idx = idx.data
+
+        if isinstance(idx, (list, tuple)):
+            idx = tuple(
+                (i.data.astype(self.xp.int64) if isinstance(i, Tensor) else self.xp.array(i, dtype=self.xp.int64))
+                if isinstance(i, (list, Tensor)) else i
+                for i in idx
+            )
+        
+        out_data = self.data[idx]
+
+        def _index_backward(input_grad):
+
+            if self.requires_grad:
+                if self.grad is None:
+                    self.grad = ap.Array.zeros_like(self.data, dtype=self.data.dtype)
+  
+                # Convert index to raw array if needed
+                actual_idx = idx
+                if isinstance(idx, Tensor):
+                    actual_idx = idx.data
+                if isinstance(actual_idx, ap.Array):
+                    actual_idx = actual_idx._array
+
+                # Elementwise assignment for fancy indexing
+                np.add.at(self.grad, actual_idx, input_grad)
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(out_data,
+                    requires_grad=requires_grad,
+                    grad_fn=_index_backward if requires_grad else None,
+                    grad_fn_name="<IndexBackward>" if requires_grad else None,
+                    device=self.device)
+        
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def __setitem__(self, idx, value):
+        """
+        Supports slices, ints, arrays, Tensors, and tuple-of-arrays indexing.
+        Performs in-place assignment on .data.
+        Gradient is not tracked for item assignment (non-differentiable op).
+        """
+        if isinstance(idx, Tensor):
+            idx = idx.data
+
+        if isinstance(idx, (list, tuple)):
+            idx = tuple(
+                (i.data.astype(self.xp.int64) if isinstance(i, Tensor) else self.xp.array(i, dtype=self.xp.int64))
+                if isinstance(i, (list, Tensor)) else i
+                for i in idx
+            )
+
+        if isinstance(value, Tensor):
+            value = value.data
+
+        self.data[idx] = value
+
+    def transpose(self, dim1, dim2):
+        """
+        Swap two dimensions of the tensor.
+        """
+        out_data = self.data.swapaxes(dim1, dim2)
+ 
+        def _transpose_backward(input_grad):
+            # Just swap back the same two dims
+            if self.requires_grad:
+                self_grad = input_grad.swapaxes(dim1, dim2)
+
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(out_data,
+                    requires_grad=requires_grad,
+                    grad_fn=_transpose_backward if requires_grad else None,
+                    grad_fn_name="<TransposeBackward>" if requires_grad else None,
+                    device=self.device)
+        
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def permute(self, *dims):
+        """
+        Permute tensor dimensions according to dims.
+        Example: (0, 2, 1) will reorder axes in that order.
+        """
+        out_data = np.transpose(self.data, axes=dims)
+
+        def _permute_backward(input_grad):
+            if self.requires_grad:
+                # Inverse permutation
+                inv_dims = np.argsort(dims)
+                self_grad = np.transpose(input_grad, axes=inv_dims)
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(out_data,
+                    requires_grad=requires_grad,
+                    grad_fn=_permute_backward if requires_grad else None,
+                    grad_fn_name="<PermuteBackward>" if requires_grad else None,
+                    device=self.device)
+        
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def reshape(self, *shape):
+        """
+        Reshape the tensor. Gradients are reshaped back to the original shape during backprop.
+        """
+        out_data = self.data.reshape(*shape)
+
+        def _reshape_backward(input_grad):
+            if self.requires_grad:
+                self_grad = input_grad.reshape(self.data.shape)
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_reshape_backward if requires_grad else None,
+            grad_fn_name="<ReshapeBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+  
+        return out
+    
+    def flatten(self, start_dim=0, end_dim=-1):
+        """
+        Flatten the tensor by reshaping it into a contiguous range of dimensions.
+
+        Args:
+            start_dim: first dimension to flatten (default: 0)
+            end_dim: last dimension to flatten (default: -1, meaning last dimension)
+
+        Gradients are reshaped back to the original shape during backprop.
+        """
+        # Handle negative indices
+        if end_dim < 0:
+            end_dim = self.data.ndim + end_dim
+        if start_dim < 0:
+            start_dim = self.data.ndim + start_dim
+
+        # Calculate new shape
+        if start_dim == 0 and end_dim == self.data.ndim - 1:
+            # Flatten everything
+            new_shape = (-1,)
+        else:
+            # Flatten only the specified range
+            new_shape = (
+                self.data.shape[:start_dim] +
+                (int(np.prod(self.data.shape[start_dim:end_dim+1])),) +
+                self.data.shape[end_dim+1:]
+            )
+
+        out_data = self.data.reshape(new_shape)
+
+        def _flatten_backward(input_grad):
+            if self.requires_grad:
+                self_grad = input_grad.reshape(self.data.shape)
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_flatten_backward if requires_grad else None,
+            grad_fn_name="<FlattenBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+
+    def unsqueeze(self, dim=0):
+  
+        out_data = np.expand_dims(self.data, axis=dim)
+
+        def _unsqueeze_backward(input_grad):
+            if self.requires_grad:
+                
+                ### Accumulate all grads along the dimension we added ###
+                grad = input_grad.sum(axis=dim)
+
+                if self.grad is None:
+                    self.grad = grad
+                else:
+                    self.grad += grad
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_unsqueeze_backward if requires_grad else None,
+            grad_fn_name="<UnsqueezeBackward>" if requires_grad else None,
+            device=self.device,
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def squeeze(self, dim=None):
+
+        shape = list(self.shape)
+
+        if dim is None:
+            # Drop all size-1 dimensions
+            out_shape = [s for s in shape if s != 1]
+        else:
+            if shape[dim] != 1:
+                raise ValueError(f"Cannot squeeze dimension {dim} of size {shape[dim]}")
+            out_shape = shape[:dim] + shape[dim+1:]
+
+        out_data = self.data.reshape(out_shape)
+
+        def _squeeze_backward(input_grad):
+            if self.requires_grad:
+                if dim is None:
+                    # Put all size-1 dims back
+                    grad = input_grad.reshape(shape)
+                else:
+                    # Only reinsert the squeezed dimension
+                    grad = np.expand_dims(input_grad, axis=dim)
+
+                grad = grad.astype(self.data.dtype, copy=False)
+
+                if self.grad is None:
+                    self.grad = grad
+                else:
+                    self.grad += grad
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_squeeze_backward if requires_grad else None,
+            grad_fn_name="<SqueezeBackward>" if requires_grad else None,
+            device=self.device,
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def chunk(input, chunks, dim=0):
+
+        """
+        Split a tensor into `chunks` along dimension `dim`.
+        Returns a list of Tensors.
+
+        to make this easy we use slices
+
+        a = ["a", "b", "c", "d", "e", "f", "g"]
+        a[1:3] = ["b", "c", "d"]
+        a[slice(1,3)] = ["b", "c", "d"]
+        """
+
+        size = input.shape[dim]
+        if size % chunks != 0:
+            raise ValueError(f"Cannot split dimension {dim} of size {size} into {chunks} equal chunks")
+        
+        chunk_size = size // chunks
+        out_tensors = []
+
+        for i in range(chunks):
+            start, end = i * chunk_size, (i + 1) * chunk_size
+
+            # Slice the underlying array directly
+            idx = [slice(None)] * input.ndim
+            idx[dim] = slice(start, end)
+            slice_data = input.data[tuple(idx)]
+
+            def _chunk_backward(input_grad, start=start, end=end):
+                if input.requires_grad:
+                    grad = input.xp.zeros_like(input.data, dtype=input.data.dtype)
+                    
+                    # Ensure input_grad has the correct shape
+                    grad_slice_shape = list(grad.shape)
+                    grad_slice_shape[dim] = end - start
+                    grad_slice = input_grad.reshape(grad_slice_shape)
+
+                    # Insert gradient slice into the right position
+                    grad_idx = [slice(None)] * grad.ndim
+                    grad_idx[dim] = slice(start, end)
+                    grad[tuple(grad_idx)] = grad_slice
+
+                    # Accumulate gradients
+                    if input.grad is None:
+                        input.grad = grad
+                    else:
+                        input.grad += grad
+
+            requires_grad = input.requires_grad and Tensor.build_graph_enabled()
+            out = Tensor(
+                slice_data,
+                requires_grad=requires_grad,
+                grad_fn=_chunk_backward if requires_grad else None,
+                grad_fn_name="<ChunkBackward>" if requires_grad else None,
+                device=input.device
+            )
+
+            if requires_grad:
+                out._add_parents(input)
+
+            out_tensors.append(out)
+
+        return out_tensors
+
+    def repeat_interleave(self, repeats, dim):
+        """
+        This method repeats a dimension however many times you want!
+        For simplicity we dont support any fancy repeat patterns, you can 
+        simply provide a dimension and repeat it some number of times!
+
+        If we have data 
+
+        [1,2]
+        [3,4]
+
+        and we repeat twice along dim=1 we get:
+
+        [1,1,2,2]
+        [3,3,4,4]
+
+        So in the backward pass we just need to sum up all the grads
+        that contributed to each output.
+
+        """
+        
+        if dim is None:
+            raise ValueError("dim must be specified for repeat_interleave")
+        if not isinstance(repeats, int) or repeats <= 0:
+            raise ValueError("repeats must be a positive integer")
+
+        shape = self.shape
+        out_data = np.repeat(self.data, repeats, axis=dim)
+    
+        def _repeat_interleave_backward(input_grad):
+            
+            if self.requires_grad:
+                # Reshape to separate the repeated dimension
+                # Shape along dim becomes: original_size * repeats
+                grad_shape = list(input_grad.shape)
+                original_size = shape[dim]
+                
+                # Reshape: move the repeated elements into a new dimension and sum
+                # New shape: [..., original_size, repeats, ...]
+                new_shape = grad_shape[:dim] + [original_size, repeats] + grad_shape[dim+1:]
+                grad_reshaped = input_grad.reshape(new_shape)
+                
+                # Sum over the repeats dimension (which is now at position dim+1)
+                grad_summed = grad_reshaped.sum(axis=dim+1)
+                
+                if self.grad is None:
+                    self.grad = grad_summed
+                else:
+                    self.grad += grad_summed
+    
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_repeat_interleave_backward if requires_grad else None,
+            grad_fn_name="<RepeatInterleaveBackward>" if requires_grad else None,
+            device=self.device,
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+
+    
+    # Reduction operators 
+
+    def sum(self, dim=None, keepdims=False):
+        """
+        Sum across a dimension.
+        Forward: output = self.data.sum(axis=dim, keepdims=keepdims)
+        Backward: distribute incoming gradient to all elements along summed axes.
+        """
+        out_data = self.data.sum(axis=dim, keepdims=keepdims)
+
+        def _sum_backward(input_grad):
+            if self.requires_grad:
+                # Broadcast input gradient to input shape
+                self_grad = np.broadcast_to(input_grad, self.shape)
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_sum_backward if requires_grad else None,
+            grad_fn_name="<SumBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def cumsum(self, dim=None):
+        """
+        Cumulative sum along a dimension.
+        Forward: out[i] = sum_{j<=i} x[j]
+        Backward: grad_x[i] = sum_{j>=i} grad_y[j]
+
+        if our inputs are [a,b,c,d]
+        then our cumulative sum is:
+        [a, a+b, a+b+c, a+b+c+d]
+
+        Then in our backward pass we have grads 
+        [g1, g2, g3, g4]
+
+        and so then we see that a contributed to g1, g2, g3, and g4
+        b contributed to g2, g3, g4
+        c contributed to g3, g4
+        d contributd to g4
+        """
+        out_data = self.data.cumsum(axis=dim)
+
+        def _cumsum_backward(input_grad):
+            if self.requires_grad:
+                # Reverse, cumsum, then reverse again
+                grad_reversed = np.flip(input_grad, axis=dim)
+                grad_input = np.cumsum(grad_reversed, axis=dim)
+                grad_input = np.flip(grad_input, axis=dim)
+
+                if self.grad is None:
+                    self.grad = grad_input
+                else:
+                    self.grad += grad_input
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_cumsum_backward if requires_grad else None,
+            grad_fn_name="<CumsumBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+
+    def mean(self, dim=None, keepdims=False):
+        """
+        Mean across a dimension.
+        Forward: output = self.data.mean(axis=dim, keepdims=keepdims)
+        Backward: broadcast incoming gradient and divide by number of elements summed.
+        """
+
+        ### if no dim is provided we reduce on all dims ###
+        if dim is None:
+            dim = tuple(range(len(self.shape)))
+
+        out_data = self.data.mean(axis=dim, keepdims=keepdims)
+
+        def _mean_backward(input_grad):
+
+            if self.requires_grad:
+                # Compute number of elements reduced over
+                dims = dim if isinstance(dim, tuple) else (dim,)
+                num_vals_averaged = np.prod([self.shape[d] for d in dims])
+
+                # Broadcast upstream gradient and scale
+                self_grad = np.broadcast_to(input_grad, self.shape) / num_vals_averaged
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_mean_backward if requires_grad else None,
+            grad_fn_name="<MeanBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def var(self, dim=None, keepdims=False):
+        """
+        Variance along a given dimension.
+        Var = mean((x - mean(x))^2)
+        
+        Backward: dVar/dx = 2 * (x - mean(x)) / N * input_grad
+        """
+
+        ### if no dim is provided we reduce on all dims ###
+        if dim is None:
+            dim = tuple(range(len(self.shape)))
+
+        # Forward pass
+        mean_vals = self.data.mean(axis=dim, keepdims=True)
+        var_vals = ((self.data - mean_vals) ** 2).mean(axis=dim, keepdims=keepdims)
+
+        def _var_backward(input_grad):
+            if self.requires_grad:
+                # Broadcast input gradient to input shape
+                input_grad_broadcast = np.broadcast_to(input_grad, self.shape)
+                
+                # Number of elements reduced over
+                dims = dim if isinstance(dim, tuple) else (dim,)
+                num_vals_reduced = np.prod([self.shape[d] for d in dims])
+                
+                # Gradient formula: 2/N * (x - mean(x)) * upstream gradient
+                centered = self.data - mean_vals
+                self_grad = 2.0 * centered * input_grad_broadcast / num_vals_reduced
+
+                if self.grad is None:
+                    self.grad = self_grad
+                else:
+                    self.grad += self_grad
+                
+                self_grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            var_vals,
+            requires_grad=requires_grad,
+            grad_fn=_var_backward if requires_grad else None,
+            grad_fn_name="<VarBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+
+    def max(self, dim=None, keepdims=False):
+        """
+        Compute max along axis with autograd support.
+        Only propagate gradient to the positions where the maximum occurred.
+        """
+
+        ### if no dim is provided we reduce on all dims ###
+        if dim is None:
+            dim = tuple(range(len(self.shape)))
+            
+        out_data = self.data.max(axis=dim, keepdims=keepdims)
+
+        def _max_backward(input_grad):
+            
+            if self.requires_grad:
+
+                grad = self.xp.zeros_like(self.data, dtype=self.data.dtype)
+
+                # Broadcast input_grad if needed
+                if dim is not None and not keepdims:
+                    input_grad = np.expand_dims(input_grad, dim)
+
+                # Broadcast to match self shape
+                input_grad = input_grad * np.ones_like(self.data, dtype=self.data.dtype)
+                
+                # Only propagate gradient to positions where max occurred
+                mask = (self.data == (out_data if keepdims else np.expand_dims(out_data, dim)))
+                grad += input_grad * mask
+    
+                # Call backward on self
+                if self.grad is None:
+                    self.grad = grad
+                else:
+                    self.grad += grad
+
+                grad = None
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_max_backward if requires_grad else None,
+            grad_fn_name="<MaxBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def argmax(self, dim=-1):
+        """
+        Compute the indices of the maximum value along a dimension.
+        Note: argmax is non-differentiable.
+        """
+        out_data = self.data.argmax(axis=dim)
+
+        def _argmax_backward(input_grad):
+            # No gradient flows through argmax
+            return ap.Array.zeros_like(self.data, dtype=self.data.dtype)
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_argmax_backward if requires_grad else None,
+            grad_fn_name="<ArgmaxBackward>" if requires_grad else None,
+            device=self.device
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+
+
+    # Other/Misc operations
+    def masked_fill(self, mask, value):
+    
+        # forward
+        out_data = np.where(mask.data, value, self.data)
+
+        def _masked_fill_backward(input_grad):
+            if self.requires_grad:
+                # Only pass gradient where mask == False
+                grad = np.where(mask.data, 0, input_grad)
+
+                if self.grad is None:
+                    self.grad = grad
+                else:
+                    self.grad += grad
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_masked_fill_backward if requires_grad else None,
+            grad_fn_name="<MaskedFillBackward>" if requires_grad else None,
+            device=self.device,
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+    
+    def sort(self, dim=-1, descending=False):
+        
+        # Forward: sort the data and get indices
+        sorted_indices = np.argsort(self.data, axis=dim)
+        if descending:
+            sorted_indices = np.flip(sorted_indices, axis=dim)
+        
+        out_data = np.take_along_axis(self.data, sorted_indices, axis=dim)
+        
+        def _sort_backward(input_grad):
+            inv_indices = np.argsort(sorted_indices, axis=dim)
+            input_grad = np.take_along_axis(input_grad, inv_indices, axis=dim)
+            if self.grad is None:
+                self.grad = input_grad
+            else:
+                self.grad += input_grad
+
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        
+        out = Tensor(
+            out_data,
+            requires_grad=requires_grad,
+            grad_fn=_sort_backward if requires_grad else None,
+            grad_fn_name="<SortBackward>" if requires_grad else None,
+            device=self.device,
+        )
+        
+        if requires_grad:
+            out._add_parents(self)
+        
+        # Return values and indices (wrapped in Tensor for indices)
+        indices_tensor = Tensor(sorted_indices, requires_grad=False, device=self.device, dtype=int32)
+
+        return out, indices_tensor
+
+    def argsort(self, dim=-1, descending=False):
+        
+        sorted_indices = np.argsort(self.data, axis=dim)
+        if descending:
+            sorted_indices = np.flip(sorted_indices)
+        
+        def _argsort_backward(input_grad):
+            # No gradient flows through argsort
+            return ap.Array.zeros_like(self.data, dtype=self.data.dtype)
+        
+        requires_grad = self.requires_grad and Tensor.build_graph_enabled()
+        out = Tensor(
+            sorted_indices,
+            requires_grad=requires_grad,
+            grad_fn=_argsort_backward if requires_grad else None,
+            grad_fn_name="<ArgsortBackward>" if requires_grad else None,
+            device=self.device,
+            dtype=int32
+        )
+
+        if requires_grad:
+            out._add_parents(self)
+
+        return out
+
+    def _add_parents(self, *parents):
+        """
+        Store references to parent tensors as weakrefs.
+        """
+
+        if not isinstance(parents, (list, tuple)):
+            parents = (parents)
+        self._parents = self._parents + tuple(weakref.ref(p) for p in parents if p is not None)
+
+    def item(self):
+        if self.data.size != 1:
+            raise ValueError("only one element tensors can be converted to a Python scalar")
+        if "cuda" in self.device:
+            return self.data.flatten()[0].get().item()
+        else:
+            return self.data.flatten()[0].item()
+
+    def astype(self, dtype, copy=False):
+
+        ### Update the Tensors Dtype using setter ###
+        self.data = self._data.astype(dtype, copy=copy)
+
+        return self
+        
+    def contiguous(self):
+        ### To map to contiguous we have to use the proper backend here ###
+        self.data = self.xp.ascontiguousarray(self.data._array, dtype=self.data.dtype)
+        return self
+    
+    def detach(self):
+
+        detached = Tensor(
+            self.data,  
+            requires_grad=False,
+            grad_fn=None,
+            grad_fn_name=None,
+            device=self.device
+        )
+
+        return detached
+    
+    def numpy(self):
+        return self.data.asnumpy()
+    
+    def clone(self):
+
+        clone = Tensor(
+            self.data.copy(), 
+            requires_grad=self.requires_grad,
+            grad_fn=self.grad_fn, 
+            grad_fn_name=self.grad_fn_name, 
+            device=self.device
+        )
+
+        return clone
+        
+    
+    def __len__(self):
+        return self.shape[0]
+
+# A wrapper factory for our tensor class
+
+def _tensor_from_array(func, device="cpu", dtype=None, requires_grad=False):
+
+    arr = func() 
+    return Tensor(arr, device=device, dtype=dtype or str(arr.dtype), requires_grad=requires_grad)
+
+# Shape-based factories
+def zeros(*shape, device="cpu", dtype=float32, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+    return _tensor_from_array(lambda: ap.Array.zeros(shape, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def ones(*shape, device="cpu", dtype=float32, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+    return _tensor_from_array(lambda: ap.Array.ones(shape, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def empty(*shape, device="cpu", dtype=float32, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+    return _tensor_from_array(lambda: ap.Array.empty(shape, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def full(*shape, fill_value, device="cpu", dtype=float32, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+    return _tensor_from_array(lambda: ap.Array.full(shape, fill_value, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+# Sequences 
+def arange(start=None, end=None, step=1, *, device="cpu", dtype="int32", requires_grad=False):
+    if end is None:
+        if start is None:
+            raise TypeError("arange() missing required argument 'end'")
+        start, end = 0, start
+
+    return _tensor_from_array(
+        lambda: ap.Array.arange(start, end, step, device=device, dtype=dtype),
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad
+    )
+
+def linspace(start, end, num=50, device="cpu", dtype=float32, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.linspace(start, end, num, device, dtype), 
+                              requires_grad=requires_grad)
+# Eye and triangular
+def eye(N, M=None, k=0, device="cpu", dtype=float32, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.eye(N, M=M, k=k, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def tril(x, k=0, device="cpu", dtype=float32, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.tril(x.data, k=k, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+# Random arrays
+def randn(*shape, device="cpu", dtype=float32, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+    return _tensor_from_array(lambda: ap.Array.randn(shape, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def rand(*shape, device="cpu", dtype=float32, requires_grad=False):
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)): shape = shape[0]
+    return _tensor_from_array(lambda: ap.Array.rand(shape, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def randint(low, high, shape, device="cpu", dtype=int32, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.randint(low=low, high=high, shape=shape, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def randn_like(tensor, device=None, dtype=None, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.randn_like(tensor.data, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def rand_like(tensor, device=None, dtype=None, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.rand_like(tensor.data, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+# Like zeros/ones_like
+def zeros_like(tensor, device=None, dtype=None, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.zeros_like(tensor.data, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def ones_like(tensor, device=None, dtype=None, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.ones_like(tensor.data, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def empty_like(tensor, device=None, dtype=None, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.empty_like(tensor.data, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+def full_like(tensor, fill_value, device=None, dtype=None, requires_grad=False):
+    return _tensor_from_array(lambda: ap.Array.full_like(tensor.data, fill_value, device=device, dtype=dtype),
+                              device=device, dtype=dtype, requires_grad=requires_grad)
+
+
